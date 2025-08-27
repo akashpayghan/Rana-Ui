@@ -1,22 +1,65 @@
 import sys
 import time
-import webbrowser  # Import the webbrowser library
+import webbrowser
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTextEdit, QFrame, QProgressBar, QLineEdit, QGridLayout
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QThread, QObject, pyqtSignal
 from PyQt6.QtGui import QColor, QPalette
 
+# ⭐ NEW: Import mavutil for pymavlink
+from pymavlink import mavutil
+
+
+# ---------------------------------------------------------------------
+# ⭐ NEW: A dedicated class to handle the MAVLink connection in a separate thread.
+# This prevents the UI from freezing during the connection process.
+class MAVLinkConnector(QObject):
+    # Signals to communicate results back to the main UI thread
+    connection_successful = pyqtSignal(object)  # The object is the MAVLink connection
+    connection_failed = pyqtSignal(str)  # The string is an error message
+
+    def __init__(self, connection_string, parent=None):
+        super().__init__(parent)
+        self.connection_string = connection_string
+        self.master = None
+
+    def connect_blocking(self):
+        """Attempts to establish a MAVLink connection."""
+        try:
+            self.master = mavutil.auto_connect(self.connection_string, baud=57600)
+
+            # Wait for a HEARTBEAT message to confirm a valid connection
+            self.master.wait_heartbeat(timeout=5)
+
+            if not self.master.target_system:
+                self.master.close()
+                self.connection_failed.emit("Connected but failed to receive a valid heartbeat from the drone.")
+                return
+
+            self.connection_successful.emit(self.master)
+
+        except Exception as e:
+            error_message = f"Connection failed: {e}"
+            self.connection_failed.emit(error_message)
+
+
+# ---------------------------------------------------------------------
 
 class DroneControlApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RANA")
+        self.setWindowTitle("PARASHARS")
         self.setGeometry(100, 100, 1200, 800)
         self.setPalette(self.get_dark_palette())
 
+        # ⭐ MODIFIED: We will use a MAVLink master object and a thread
         self.is_connected = False
+        self.master = None
+        self.connection_thread = None
+        self.connector = None
+
         self.init_ui()
 
     def get_dark_palette(self):
@@ -50,7 +93,7 @@ class DroneControlApp(QWidget):
         header_layout.setContentsMargins(20, 10, 20, 10)
 
         # App Logo (Placeholder Label)
-        logo_label = QLabel("RANA")
+        logo_label = QLabel("PARASHAR")
         logo_label.setStyleSheet("color: #06B6D4; font-size: 28px; font-weight: bold; letter-spacing: 2px;")
         header_layout.addWidget(logo_label)
         header_layout.addStretch()
@@ -74,6 +117,7 @@ class DroneControlApp(QWidget):
                 background-color: #2338CA;
             }
         """)
+        # ⭐ MODIFIED: This button will now try to connect to the drone's MAVLink system
         self.connect_btn.clicked.connect(self.connect_drone)
         header_layout.addWidget(self.connect_btn)
 
@@ -204,7 +248,7 @@ class DroneControlApp(QWidget):
 
         right_panel_layout.addWidget(controls_frame)
 
-        # --- New Section for Raspberry Pi Connect ---
+        # --- Raspberry Pi Connection Section ---
         rpi_frame = QFrame()
         rpi_frame.setStyleSheet("background-color: #0C121F; border: 1px solid #1E293B; border-radius: 10px;")
         rpi_layout = QGridLayout(rpi_frame)
@@ -213,19 +257,20 @@ class DroneControlApp(QWidget):
         rpi_title.setStyleSheet("color: #F97316; font-size: 18px; font-weight: bold;")
         rpi_layout.addWidget(rpi_title, 0, 0, 1, 2)
 
-        # Input field for the link code
-        rpi_link_label = QLabel("Link Code:")
+        # Input field for the connection string
+        rpi_link_label = QLabel("Connection String:")
         rpi_link_label.setStyleSheet("color: #94A3B8;")
         self.rpi_link_input = QLineEdit()
-        self.rpi_link_input.setPlaceholderText("e.g., a-b-c-d")
+        # ⭐ MODIFIED: Placeholder text now guides the user for MAVLink connections
+        self.rpi_link_input.setPlaceholderText("e.g., tcp:192.168.1.100:5760")
         self.rpi_link_input.setStyleSheet(
             "background-color: #1F2937; border: 1px solid #4B5563; border-radius: 5px; padding: 5px; color: #E5E7EB;")
 
         rpi_layout.addWidget(rpi_link_label, 1, 0)
         rpi_layout.addWidget(self.rpi_link_input, 1, 1)
 
-        # Button to open the web browser
-        self.rpi_connect_btn = QPushButton("Connect to Pi")
+        # Button to connect to the drone
+        self.rpi_connect_btn = QPushButton("Connect to Drone")
         self.rpi_connect_btn.setStyleSheet("""
             QPushButton {
                 background-color: #F97316; 
@@ -238,13 +283,13 @@ class DroneControlApp(QWidget):
                 background-color: #EA580C;
             }
         """)
-        self.rpi_connect_btn.clicked.connect(self.connect_to_pi)
+        # ⭐ MODIFIED: This button will now call the new connection method
+        self.rpi_connect_btn.clicked.connect(self.start_mavlink_connection)
         rpi_layout.addWidget(self.rpi_connect_btn, 2, 0, 1, 2)
 
         right_panel_layout.addWidget(rpi_frame)
 
-        content_layout.addLayout(right_panel_layout, 2)  # Set stretch factor
-
+        content_layout.addLayout(right_panel_layout, 2)
         main_layout.addLayout(content_layout)
 
     def log_message(self, message, color=""):
@@ -252,6 +297,55 @@ class DroneControlApp(QWidget):
         time_str = time.strftime("[%H:%M:%S]")
         colored_message = f"<span style='color: #64748B;'>{time_str}</span> <span style='color: {color};'>{message}</span>"
         self.log_feed.append(colored_message)
+
+    # ⭐ NEW: Method to initiate the MAVLink connection
+    def start_mavlink_connection(self):
+        connection_string = self.rpi_link_input.text().strip()
+
+        if not connection_string:
+            self.log_message("Please enter a connection string.", "#EF4444")
+            return
+
+        self.log_message(f"Attempting MAVLink connection to: {connection_string}...", "#F97316")
+        self.rpi_connect_btn.setEnabled(False)
+        self.rpi_link_input.setEnabled(False)
+
+        # Create a new thread and the worker object
+        self.connection_thread = QThread()
+        self.connector = MAVLinkConnector(connection_string)
+        self.connector.moveToThread(self.connection_thread)
+
+        # Connect signals and slots
+        self.connection_thread.started.connect(self.connector.connect_blocking)
+        self.connector.connection_successful.connect(self.handle_connection_success)
+        self.connector.connection_failed.connect(self.handle_connection_failure)
+
+        # Clean up when the thread finishes
+        self.connection_thread.finished.connect(self.connection_thread.deleteLater)
+        self.connector.connection_successful.connect(self.connection_thread.quit)
+        self.connector.connection_failed.connect(self.connection_thread.quit)
+
+        # Start the thread
+        self.connection_thread.start()
+
+    # ⭐ NEW: Slot to handle a successful connection
+    def handle_connection_success(self, master_conn):
+        self.master = master_conn
+        self.is_connected = True
+        self.log_message("MAVLink Connection SUCCESSFUL!", "#22C55E")
+        self.status_label.setText("STATUS: DRONE CONNECTED")
+        self.status_label.setStyleSheet("color: #22C55E; font-size: 14px; font-weight: bold;")
+        self.rpi_connect_btn.setText("DISCONNECT")
+        self.rpi_connect_btn.setEnabled(True)
+        self.rpi_link_input.setEnabled(True)
+        self.takeoff_btn.setEnabled(True)
+        self.land_btn.setEnabled(True)
+
+    # ⭐ NEW: Slot to handle a failed connection
+    def handle_connection_failure(self, error_message):
+        self.log_message(f"Connection FAILED: {error_message}", "#EF4444")
+        self.rpi_connect_btn.setEnabled(True)
+        self.rpi_link_input.setEnabled(True)
 
     def connect_drone(self):
         """Simulates the drone connection process."""
@@ -282,21 +376,7 @@ class DroneControlApp(QWidget):
     def log_emergency_land(self):
         self.log_message("EMERGENCY LANDING INITIATED!", "#EF4444")
 
-    def connect_to_pi(self):
-        """Opens the Raspberry Pi Connect remote shell in a web browser."""
-        link_code = self.rpi_link_input.text().strip()
-
-        # Simple validation for the link code format (e.g., a-b-c-d)
-        if not link_code or len(link_code.split('-')) != 4:
-            self.log_message("Invalid link code format. Please check the code from your Raspberry Pi.", "#EF4444")
-            return
-
-        connect_url = f"https://connect.raspberrypi.com/shell/{link_code}"
-        self.log_message(f"Opening Raspberry Pi Connect for code '{link_code}' in your default web browser...",
-                         "#F97316")
-
-        # Open the URL in the default web browser
-        webbrowser.open(connect_url)
+    # ⭐ REMOVED: The original connect_to_pi method that used webbrowser is no longer needed.
 
 
 if __name__ == '__main__':
